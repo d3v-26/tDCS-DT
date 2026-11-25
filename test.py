@@ -14,7 +14,7 @@ from monai.inferers import SlidingWindowInferer
 from monai.metrics import SSIMMetric
 
 #Load Custom
-from utils import create_test_dataloader, MultiModel, reg_ece
+from utils import create_test_dataloader, MultiModel, reg_ece, mscr_loss
 
 
 def center_crop(t, roi):
@@ -82,6 +82,7 @@ def main():
                 'MSE': ((output - label) ** 2).mean().item(),
                 'SSIM': ssim(output, label).mean().item(),
                 'ECE': reg_ece(output, label).item(),
+                'MSCR': mscr_loss(output, label).item(),
                 'Accuracy': 100.0 * (output_class == vector_label).float().item(),
             }
             group = 'Old' if batch['shape'][0][1].item() == 256 else 'Young'

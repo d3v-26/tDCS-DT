@@ -169,6 +169,20 @@ class MultiModel(nn.Module):
 # Other
 
 
+def mscr_loss(output, label, device=None, eps=1e-6):
+    """MSCR: masked MSE over voxels where the label carries current (label > eps).
+
+    Same result as the version recovered from an earlier session ((output*mask - label*mask)^2 summed / mask count).
+    Background voxels are ignored, so false positives outside the head are not penalised.
+    Returns 0 if the mask is empty. `device` is kept for the original call signature.
+    """
+    mask = label > eps
+    n = mask.sum()
+    if n == 0:
+        return torch.zeros((), device=output.device)
+    return ((output - label)[mask] ** 2).sum() / n
+
+
 def reg_ece(predictions, targets, num_bins=10, device=None):
     """Regression calibration error: mean |pred - target| per prediction-value bin, averaged over bins.
 

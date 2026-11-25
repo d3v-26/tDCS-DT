@@ -103,7 +103,7 @@ Measured on the real data:
 - `-root_dir` now points to the **cache** directory (default `cache`).
 
 ### `test.py` (rewritten)
-- Uses the cache. Full-volume sliding window. Metrics: MAE, MSE, SSIM, ECE (replaces the undefined `mscr_loss`),
+- Uses the cache. Full-volume sliding window. Metrics: MAE, MSE, SSIM, ECE, MSCR (see section 6),
   montage accuracy (classifier on the centre `roi` crop). Labels are clipped at 3.0 as in the original.
   Results are reported for All / Old (256³) / Young (HCP) as before. Predictions are saved with the real T1 affine.
 
@@ -200,3 +200,18 @@ Estimate: 354 steps × ~1.4 s ≈ 8.5 min/epoch, plus validation every 2 epochs,
 
 **Full run submitted: job 52782720** → `Models/best_model.pth` (best val MAE) and `Models/best_model_last.pth`
 (resumable every epoch). Log: `logs/tdcs_train_52782720.out`.
+
+---
+
+## 6. MSCR metric restored (2026-11-25)
+
+The original `test.py` reported "MSCR" via `mscr_loss`, which is not defined in any commit of the repo. The original
+`train.py` had already replaced it with `reg_ece` as the training loss (`loss3 = reg_ece(...) #mscr_loss(...)`), so the
+training loss is unchanged.
+
+The user found a definition in an earlier session. It is now `utils.mscr_loss` and is reported by `test.py` next to ECE:
+**masked MSE over voxels with label > 1e-6**, i.e. `sum((pred - label)^2 on mask) / mask count`.
+- Despite the name, it is not a calibration measure. It is an error measure restricted to voxels that carry current.
+- Background false positives (pred > 0 where label = 0) are not penalised. The full-volume MAE/MSE cover those.
+- Provenance is unconfirmed (not in the repo history). Check it against the paper's methods section before comparing numbers.
+- The implementation (`(pred-label)[mask]`) is mathematically identical to the pasted original. A numerical check against it is pending.
