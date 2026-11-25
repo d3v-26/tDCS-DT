@@ -1,224 +1,194 @@
 #Load Standard Libraries
+import inspect
 import os
-import glob
-import nibabel as nib
+
 import numpy as np
-import math
 
 #Load Torch Libraries
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from torchvision.models import swin_transformer
-import torchio as tio
-import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, DistributedSampler, Subset
 
 #Load Monai Packages
 from monai.networks.nets import SwinUNETR, EfficientNet
-from monai.transforms import ScaleIntensityd, ToTensord, RandSpatialCropd, RandFlipd, RandRotate90d, RandShiftIntensityd, Compose, ThresholdIntensityd
-from monai.data import Dataset
-from monai.inferers import SlidingWindowInferer
-from monai.losses import DiceCELoss
-from monai.metrics import DiceMetric
 
 ##########################################################################################################################
 
 # Dataloading Tools
+#
+# Data comes from the .npy cache written by preprocess.py (T1 already scaled to [0, 1]).
+# Each (subject, montage) pair is one sample, exactly like the original CustomDataset:
+#   vector [[1],[0]] -> F3-F4,  vector [[0],[1]] -> C3-Fp2
 
-# Define Custom Data Usage
-class CustomDataset(tio.data.SubjectsDataset):
-    def __init__(self, root_dir, transform=None, subjectsIDS = 'file.npz'):
-        self.root_dir = root_dir
-        self.transform = transform
-        self.subjectsIDS = subjectsIDS
-        self.subjects = self.load_subjects(self.subjectsIDS)
+MONTAGES = ('F3F4', 'C3Fp2')
+
+
+def load_ids(cache_dir, split):
+    path = os.path.join(cache_dir, split, 'ids.npy')
+    if not os.path.exists(path):
+        raise FileNotFoundError(f'{path} not found - run preprocess.py first')
+    return [str(s) for s in np.load(path)]
+
+
+class TDCSDataset(Dataset):
+    def __init__(self, cache_dir, split, roi_size=None, train=False, spatial_aug=False, ids=None):
+        self.dir = os.path.join(cache_dir, split)
+        self.ids = ids if ids is not None else load_ids(cache_dir, split)
+        self.items = [(sid, m) for sid in self.ids for m in range(len(MONTAGES))]
+        self.roi_size = tuple(roi_size) if roi_size is not None else None
+        self.train = train
+        self.spatial_aug = spatial_aug
 
     def __len__(self):
-        return len(self.subjects)
+        return len(self.items)
+
+    def _crop_slices(self, shape):
+        # Random crop for training, centre crop otherwise (original val/test used RandSpatialCropd,
+        # which made the validation metric non-deterministic).
+        sl = []
+        for dim, roi in zip(shape, self.roi_size):
+            if dim <= roi:
+                sl.append(slice(0, dim))
+                continue
+            start = np.random.randint(0, dim - roi + 1) if self.train else (dim - roi) // 2
+            sl.append(slice(start, start + roi))
+        return tuple(sl)
+
+    def _pad(self, arr):
+        pad = [(0, max(0, r - s)) for s, r in zip(arr.shape, self.roi_size)]
+        return np.pad(arr, pad) if any(p[1] for p in pad) else arr
 
     def __getitem__(self, index):
-        subject = self.subjects[index]
+        sid, m = self.items[index]
+        t1 = np.load(os.path.join(self.dir, f'{sid}_T1.npy'), mmap_mode='r')
+        label = np.load(os.path.join(self.dir, f'{sid}_J_{MONTAGES[m]}.npy'), mmap_mode='r')
+        shape = t1.shape
 
-        if self.transform:
-            subject = self.transform(subject)
+        if self.roi_size is not None:
+            sl = self._crop_slices(shape)
+            t1, label = self._pad(np.asarray(t1[sl])), self._pad(np.asarray(label[sl]))
+        else:
+            t1, label = np.asarray(t1), np.asarray(label)
 
+        if self.train and self.spatial_aug:
+            # Same augmentation as the original pipeline (RandFlipd x3 p=0.1, RandRotate90d p=0.1).
+            # NOTE: an L/R flip turns C3-Fp2 into C4-Fp1, so this mislabels data; off by default.
+            for axis in range(3):
+                if np.random.rand() < 0.1:
+                    t1, label = np.flip(t1, axis), np.flip(label, axis)
+            if np.random.rand() < 0.1:
+                k = np.random.randint(1, 4)
+                t1, label = np.rot90(t1, k, axes=(0, 1)), np.rot90(label, k, axes=(0, 1))
+
+        vector = torch.zeros(len(MONTAGES), 1)
+        vector[m, 0] = 1.0
         return {
-            'input_data': subject['T1'], # Primary image data input for deep learning model
-            'label': subject['label'],   # J current map for either F3F4 or C3Fp2 electrode montages
-            #'seg': subject['seg'],       # Model Segmentation output
-            'vector': subject['vector'], # Model input to indicate if J is from F3F4 [1,0] or C3Fp2 [0,1]
-            'Name': subject['Name'],     # Extracted from image file. used to match data (this script) and save results (infer. script)
+            'input_data': torch.from_numpy(np.ascontiguousarray(t1)).unsqueeze(0),        # float16, [0,1]
+            'label': torch.from_numpy(np.ascontiguousarray(label)).float().unsqueeze(0),
+            'vector': vector,
+            'montage': m,
+            'Name': f'{sid}_{MONTAGES[m]}',
+            'subject': sid,
+            'shape': torch.tensor(shape),
         }
 
-    def load_subjects(self, subjectsIDS):
-        subject_list = []
 
-        # Manually specify the order of modalities so that the J files don't get mixed up
-        modality_order = ['T1', 'J_F3F4', 'J_C3Fp2']#, 'seg11']
-            
-        subject_ids = np.load(subjectsIDS)
-        #print(subject_ids)
-        
-        # Iterate over all subjects
-        for subject_id in subject_ids:
-            subject_images = {}
-            #print(f"individual id: {subject_id}")
+def _loader(dataset, batch_size, shuffle, num_workers, drop_last=False, sampler=None):
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, sampler=sampler, num_workers=num_workers,
+                      pin_memory=torch.cuda.is_available(), drop_last=drop_last,
+                      persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None)
 
-            for modality_name in modality_order:
-                modality_path = os.path.join(self.root_dir, modality_name)
-                # All data follows the following format within its subfolder
-                image_path = os.path.join(modality_path, f'{subject_id}.nii')
-                try:
-                    # We will also skip subjects who have corrupted data
-                    image_data = nib.load(image_path).get_fdata()
-                except nib.filebasedimages.ImageFileError:
-                    print(f"Cannot determine file type of {image_path}")
-                    break
-                    
-                # Make 4D
-                image_data = np.expand_dims(image_data, axis=0)  
-                subject_images[modality_name] = image_data
 
-            # If no errors: Create subjects for 'J_F3F4' and 'J_C3Fp2' - we create two subjects per one MRI
-            subject_f3f4 = {
-                'T1': subject_images['T1'],
-                'label': subject_images['J_F3F4'],
-                'vector': torch.tensor([[1], [0]], dtype=torch.float32),  # [1, 0] indicates 'J_F3F4'
-                #'seg': subject_images['seg11'],
-                'Name' : subject_id + '_F3F4',
-            }
-            subject_c3fp2 = {
-                'T1': subject_images['T1'],
-                'label': subject_images['J_C3Fp2'],
-                'vector': torch.tensor([[0], [1]], dtype=torch.float32),  # [0, 1] indicates 'J_C3Fp2'
-                #'seg': subject_images['seg11'],
-                'Name' : subject_id + '_C3Fp2',
-            }
-
-            subject_list.append(subject_f3f4)
-            subject_list.append(subject_c3fp2)
-            #print("subject done")
-        #print("all done")
-        return subject_list
-
-def create_dataloaders(batch_size, root_dir, train_subjects_path, val_subjects_path, x, y, z):
-    # Define transformations 
-    transform_train = Compose([
-        ScaleIntensityd(minv=0, maxv=1, keys=['T1']),
-        RandSpatialCropd(keys=['T1', 'label'], roi_size=(x, y, z), random_size=False),
-        RandFlipd(keys=["T1", "label"], spatial_axis=[0], prob=0.10),
-        RandFlipd(keys=["T1", "label"], spatial_axis=[1], prob=0.10),
-        RandFlipd(keys=["T1", "label"], spatial_axis=[2], prob=0.10),
-        RandRotate90d(keys=["T1", "label"], prob=0.10, max_k=3),
-        ToTensord(keys=['T1', 'vector', 'label'])
-    ])
-
-    transform_test = Compose([
-        ScaleIntensityd(minv=0, maxv=1, keys=['T1']),
-        RandSpatialCropd(keys=['T1', 'label'], roi_size=(x, y, z), random_size=False),
-        ToTensord(keys=['T1', 'vector', 'label'])
-    ])
-    
-    # Define datasets
-    train_dataset = CustomDataset(root_dir=os.path.join(root_dir, 'Train'), transform=transform_train, subjectsIDS=train_subjects_path)
-    val_dataset = CustomDataset(root_dir=os.path.join(root_dir, 'Val'), transform=transform_test, subjectsIDS=val_subjects_path)
-    
-    # Define dataloaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-
+def create_dataloaders(batch_size, cache_dir, x, y, z, num_workers=8, spatial_aug=False, rank=0, world_size=1):
+    """batch_size is per GPU. With world_size > 1 the training set is sharded with a DistributedSampler and the
+    validation set is split round-robin across ranks (each rank evaluates a disjoint subset)."""
+    train_ds = TDCSDataset(cache_dir, 'Train', roi_size=(x, y, z), train=True, spatial_aug=spatial_aug)
+    # Validation runs on the full volume with a sliding window (shapes differ -> batch size 1).
+    val_ds = TDCSDataset(cache_dir, 'Val', roi_size=None, train=False)
+    if world_size > 1:
+        sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
+        train_loader = _loader(train_ds, batch_size, False, num_workers, drop_last=True, sampler=sampler)
+        val_ds = Subset(val_ds, list(range(rank, len(val_ds), world_size)))
+    else:
+        train_loader = _loader(train_ds, batch_size, True, num_workers, drop_last=True)
+    val_loader = _loader(val_ds, 1, False, max(1, num_workers // 2))
     return train_loader, val_loader
 
-def create_test_dataloader(batch_size, root_dir, test_subjects_path, x, y, z):
-    transform_test = Compose([
-        ScaleIntensityd(minv=0, maxv=1, keys=['T1']),
-        ThresholdIntensityd(keys=['label'], threshold=3.0, above=False, cval=3.0), 
-        RandSpatialCropd(keys=['T1', 'label'], roi_size=(260, 311, 260), random_size=False),
-        ToTensord(keys=['T1', 'vector', 'label']),#, 'seg']),
-    ])
 
-    test_dataset = CustomDataset(root_dir=os.path.join(root_dir, 'Test'), transform=transform_test, subjectsIDS=test_subjects_path)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    
-    return test_loader
+def create_test_dataloader(cache_dir, num_workers=4):
+    return _loader(TDCSDataset(cache_dir, 'Test', roi_size=None, train=False), 1, False, num_workers)
 
 ##########################################################################################################################
 
 # Model
 
+
 class MultiModel(nn.Module):
-    def __init__(self, in_channels_img, in_channels_vector, out_channels,x,y,z):
+    def __init__(self, in_channels_img, in_channels_vector, out_channels, x, y, z,
+                 feature_size=24, use_checkpoint=False, use_flash_attention=False):
         super(MultiModel, self).__init__()
-        self.backbone = SwinUNETR(img_size=(x,y,z), in_channels=in_channels_img, out_channels=out_channels, spatial_dims=3)#, use_checkpoint=True)
-        
+        kw = dict(in_channels=in_channels_img, out_channels=out_channels, spatial_dims=3,
+                  feature_size=feature_size, use_checkpoint=use_checkpoint)
+        if 'img_size' in inspect.signature(SwinUNETR.__init__).parameters:  # removed in MONAI >= 1.5
+            kw['img_size'] = (x, y, z)
+        if use_flash_attention:  # MONAI >= 1.5: fused SDPA, avoids materialising the window-attention matrix
+            if 'use_flash_attention' not in inspect.signature(SwinUNETR.__init__).parameters:
+                raise ValueError('use_flash_attention needs MONAI >= 1.5')
+            kw['use_flash_attention'] = True
+        self.backbone = SwinUNETR(**kw)
+
         self.head = nn.Conv3d(out_channels + in_channels_vector, 1, kernel_size=1)
 
         blocks_args_str = [
-            "r1_k3_s11_e1_i32_o16_se0.25",    
+            "r1_k3_s11_e1_i32_o16_se0.25",
             "r2_k3_s22_e6_i16_o24_se0.25",
             "r2_k5_s22_e6_i24_o40_se0.25",
             "r3_k3_s22_e6_i40_o80_se0.25",
             "r3_k5_s11_e6_i80_o112_se0.25",
-            "r4_k5_s22_e6_i112_o192_se0.25",   
-            "r4_k5_s22_e6_i192_o320_se0.25",   
+            "r4_k5_s22_e6_i112_o192_se0.25",
+            "r4_k5_s22_e6_i192_o320_se0.25",
         ]
         self.montage = EfficientNet(blocks_args_str, num_classes=2, image_size=x, spatial_dims=3, in_channels=1)
 
-    def forward(self, x_img, x_vector):
+    def predict(self, x_img, x_vector):
+        """E-field map only (no montage classifier) - used for sliding-window inference."""
         backbone_output = self.backbone(x_img)
-        
-        # Ensure x_vector has the correct size: batch x 2 x 1
-        x_vector = x_vector.unsqueeze(2).unsqueeze(3)
-    
-        # Concatenate along the channel dimension
-        aa,bb,cc,dd,ee = backbone_output.shape #Batch x Channel x Length x Width x Height
-        concatenated_input = torch.cat([backbone_output, x_vector.repeat(1, 1, cc, dd, ee)], dim=1)
-        
-        output = self.head(concatenated_input)
-        
+        # x_vector: B x 2 x 1 -> B x 2 x 1 x 1 x 1, broadcast over space (expand: no memory copy).
+        # A batch-1 vector is also broadcast over the batch (sliding-window inference with sw_batch_size > 1).
+        b = backbone_output.shape[0]
+        x_vector = x_vector.to(backbone_output.dtype)[..., None, None].expand(b, -1, *backbone_output.shape[2:])
+        return self.head(torch.cat([backbone_output, x_vector], dim=1))
+
+    def forward(self, x_img, x_vector):
+        output = self.predict(x_img, x_vector)
         output_class = self.montage(output)
-        
-        return output, output_class 
-    
+        return output, output_class
+
 ##########################################################################################################################
 
 # Other
 
-def reg_ece(predictions, targets, num_bins=10, device = 'cpu'):
-    # Calculate absolute differences between predictions and targets
-    errors = np.abs(predictions - targets)#.to(device)
-    
-    # Define confidence bins
-    bin_boundaries = np.linspace(np.min(predictions), np.max(predictions), num_bins + 1)#.to(device)
-    
-    # Initialize arrays to store mean predictions and errors per bin
-    mean_predictions = np.zeros(num_bins)#.to(device)
-    mean_errors = np.zeros(num_bins)#.to(device)
-    
-    # Iterate over bins
-    for i in range(num_bins):
-        # Find indices where predictions fall into the current bin
-        bin_indices = np.where((predictions >= bin_boundaries[i]) & (predictions < bin_boundaries[i+1]))#.to(device)
-        
-        # Calculate mean prediction and mean error for the current bin
-        if len(bin_indices[0]) > 0:
-            mean_predictions[i] = np.mean(predictions[bin_indices])#.to(device)
-            mean_errors[i] = np.mean(errors[bin_indices])#.to(device)
-    
-    # Calculate weighted average of calibration errors
-    weights = np.diff(bin_boundaries)[:-1]#).to(device)  # Width of each bin
-    #mean_errors = mean_errors.cpu()
-    mean_errors = mean_errors[:len(weights)]
-    ece = torch.from_numpy(np.array(np.average(mean_errors, weights=weights))).to(device)
-    
-    return ece
+
+def reg_ece(predictions, targets, num_bins=10, device=None):
+    """Regression calibration error: mean |pred - target| per prediction-value bin, averaged over bins.
+
+    Torch re-implementation of the original numpy version. The numpy version could not run on CUDA
+    tensors that require grad and, even on CPU, produced a constant (no gradient). Here bin membership
+    is treated as constant and the gradient flows through the per-bin errors. Empty bins are ignored
+    (the original counted them as 0 and silently dropped the last bin).
+    """
+    pred = predictions.float().flatten()
+    err = (pred - targets.float().flatten()).abs()
+    with torch.no_grad():
+        lo, hi = pred.min(), pred.max()
+        edges = torch.linspace(0, 1, num_bins + 1, device=pred.device) * (hi - lo) + lo
+        idx = torch.bucketize(pred, edges[1:-1], right=True)
+        counts = torch.bincount(idx, minlength=num_bins)
+    sums = torch.zeros(num_bins, device=pred.device, dtype=err.dtype).scatter_add(0, idx, err)
+    nonempty = counts > 0
+    return (sums[nonempty] / counts[nonempty]).mean()
+
 
 def vector_class(vector, device='cpu'):
-    # Create the desired meta tensor
-    desired_meta_tensor = torch.zeros(vector.size(0), dtype=torch.long, device=device)
-
-    # Set values to 0 where the metatensor has [[1.], [0.]] and 1 where the metatensor has [[0.], [1.]]
-    desired_meta_tensor[(vector[:, 0, 0] == 1) & (vector[:, 1, 0] == 0)] = 0
-    desired_meta_tensor[(vector[:, 0, 0] == 0) & (vector[:, 1, 0] == 1)] = 1
-
-    return desired_meta_tensor
+    """[[1],[0]] -> 0 (F3F4), [[0],[1]] -> 1 (C3Fp2)."""
+    return vector[:, :, 0].argmax(dim=1).to(device)

@@ -1,0 +1,10 @@
+tDCS_DT_data
+cache/
+Models/
+Results/
+logs/*
+!logs/*.py
+!logs/*.sbatch
+__pycache__/
+*.pth
+envs/

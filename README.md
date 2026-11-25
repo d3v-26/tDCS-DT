@@ -76,27 +76,28 @@ pip install -r requirements.txt
 conda deactivate
 ```
 
+### Preprocessing (run once)
+Convert the NIfTI data into a memory-mapped `.npy` cache. Each volume is read once, the T1 is scaled to [0, 1], and the padded ROAST outputs are aligned:
+
+```
+python preprocess.py -root_dir <raw data dir with Train/Val/Test> -out_dir cache -workers 16
+# HiPerGator: sbatch slurm/preprocess.sbatch
+```
+
 ### Training
-The training code can be run as below:
-
 ```
-conda activate tdcs
-
-python train.py -x 256 -y 256 -z 256 -batch_size 2 -root_dir 'Data' -num_epochs 100 -save_path 'model.pth'
+python train.py -root_dir cache -x 128 -y 128 -z 128 -batch_size 2 -num_epochs 120 -flash_attention -save_path Models/best_model.pth
+# HiPerGator: sbatch slurm/train.sbatch            resume: sbatch slurm/train.sbatch -resume Models/best_model_last.pth
 ```
 
-Change x, y, and z to the dimensions of your image size or your desired image size after cropping. The training code will crop the images automatically if you select a smaller size than your total image size. The batch_size can be changed depending on the memory of your gpu. The root_dir is where your source data is located. The num_epochs can be any number. The save_path is where your trained model saves.
+`-root_dir` is the cache directory. x, y and z set the training crop and must be divisible by 32. Training uses bf16 autocast, a multi-worker loader, AdamW with warmup and cosine decay, and full-volume sliding-window validation every `-val_every` epochs. See `python train.py -h` for all options and `NOTES_training.md` for what changed relative to the original code and why.
 
 ### Testing
-The training code can be run as below:
-
 ```
-conda activate tdcs
-
-python test.py -x 256 -y 256 -z 256 -batch_size 2 -root_dir 'Data' -save_path 'model.pth'
+python test.py -root_dir cache -x 128 -y 128 -z 128 -flash_attention -save_path Models/best_model.pth -results_path best_model
 ```
 
-The testing code needs to use the same arguments as the training code to work correctly. 
+Use the same x/y/z, `-feature_size` and `-flash_attention` as in training. Predictions are written to `Results/<results_path>/` with the original T1 affine.
 
 ## Acknowledgement
 

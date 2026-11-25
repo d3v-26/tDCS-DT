@@ -1,16 +1,14 @@
-# Standard Libraries 
+# Tested 2026-11-25 on HiPerGator (L4 / RTX PRO 6000 Blackwell), Python 3.12.
+# Exact environment (all transitive packages): requirements.lock.txt
+# The previous pins (torch 1.9 / torchvision 0.10 / monai 1.1) could not run train.py (see NOTES_training.md).
+#
+# Setup (project-local env at ./envs/tdcs):
+#   uv venv --python 3.12 envs/tdcs
+#   uv pip install --python envs/tdcs/bin/python torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
+#   uv pip install --python envs/tdcs/bin/python -r requirements.txt
+
 numpy
-nibabel
-glob2
-argparse 
-
-# PyTorch and torchvision 
-torch==1.9.0 
-torchvision==0.10.0 
-torchaudio==0.9.0
-
-# MONAI 
-monai==1.1.0 
-
-# TorchIO 
-torchio==0.18.57
+nibabel==5.5.0
+torch==2.14.1      # CUDA 13.0 build (cu130 index above)
+monai==1.6.1       # >=1.5 needed for the SwinUNETR API used in utils.py
+einops==0.8.2       # required by MONAI SwinUNETR (optional dep, not pulled in by monai)
